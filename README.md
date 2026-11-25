@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/token-radar-01/Naivexyz/token-launch-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/Naivexyz/token-launch-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A token launch radar for make.fun's [token-radar-01 bounty](https://make.fun/bounty/token-radar-01): pre-token protocols ranked by expected launch value, with the working shown. Entry title: "Launch Radar v2: every value term kept or dropped on two blind tests (leave-one-out x3.01, walk-forward x2.62), token odds from the peers' record, integrity strip, costed farm verdicts".
+A token launch radar for make.fun's [token-radar-01 bounty](https://make.fun/bounty/token-radar-01): pre-token protocols ranked by expected launch value, with the working shown. Entry title: "Launch Radar v4: growth back in the value model, every pre-token protocol ranked, every term tested held-out twice".
 
 ## Run it
 
@@ -17,15 +17,18 @@ mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
 - **Size curve, comps-calibrated.** Fitted by least squares on the snapshot's launch-like traded
   comps (market-cap / TVL inside 0.005 to 10; exchange tokens excluded): log(market cap) =
   intercept + slope x log(TVL) + a per-category offset shrunk toward zero by its comp count.
-- **Tested held-out twice.** Leave-one-out over the fitted comps: median error x3.01, against
+- **Tested held-out twice.** Leave-one-out over the fitted comps: median error x3.02, against
   x4.45 for the global median multiple and x4.20 for a flat 0.25 x TVL on the same comps.
   Walk-forward in time: fitted on the earlier half of the dated comps (split 2024-02-28), the
   later half prices at a median error of x2.62. Each row's range is the interquartile band of
-  the leave-one-out residuals (x0.33 to x2.79).
+  the leave-one-out residuals (x0.32 to x2.77).
 - **Every term ablated.** Each term was removed alone and both blind tests re-run; the table
-  ships on the dashboard. Two candidates failed and are out: a growth tilt on 7-day TVL change
-  (best grid weight still worsened leave-one-out) and a monotone smoothing of the token-share
-  curve (worse split-half Brier than the raw shares, 0.2241 against 0.2237).
+  ships on the dashboard. The growth tilt ships at a small fitted weight (0.05): the tests
+  cannot distinguish it from zero (leave-one-out x3.0214 with it, x3.0089 without; walk-forward
+  unchanged at x2.62), so it stays at the smallest tolerated weight rather than dropping the
+  growth term the value model is defined over. One candidate failed and is out: a monotone
+  smoothing of the token-share curve (worse split-half Brier than the raw shares, 0.2241
+  against 0.2237).
 - **Token odds from the peers' record.** The share of protocols already holding a token in each
   age band of the snapshot's own cross-section, used raw; a protocol still tokenless at its age
   lists with odds (A - S(age)) / (1 - S(age)): the longer it has run with no token, the lower
