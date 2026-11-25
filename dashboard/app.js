@@ -230,7 +230,7 @@
     return el('div', { class: 'strip', role: 'note' },
       el('span', null, 'INTEGRITY ', el('b', { text: a.total + ' accounted' }), ' = ' + a.ranked + ' ranked + ' + a.live + ' live + ' + a.unranked + ' not ranked + ' + a.versioned + ' versioned pools + ' + a.cex + ' exchanges + ' + a.wrapped_or_staked + ' wrapped/staked'),
       el('span', null, 'RECOMPUTED ', el('b', { text: recomputed + ' / ' + DATA.board_size }), ' rows agree with the shipped fit'),
-      el('span', null, 'HELD-OUT ', el('b', { text: 'x' + M.loo_model_factor }), ' median error vs x' + M.loo_global_factor + ' global median, x' + M.loo_flat_factor + ' flat 0.25'),
+      el('span', null, 'HELD-OUT ', el('b', { text: 'x' + M.loo_model_factor }), ' leave-one-out, ', el('b', { text: 'x' + M.wf_model_factor }), ' walk-forward median error vs x' + M.loo_global_factor + '/x' + M.wf_global_factor + ' global median, x' + M.loo_flat_factor + '/x' + M.wf_flat_factor + ' flat 0.25'),
       el('span', { class: 'warn', text: 'Implied value is a model estimate with a wide range, not a price. See Method.' })
     );
   }
@@ -352,17 +352,50 @@
     );
   }
 
+  function ablationTable() {
+    var bodyRows = M.ablation.map(function (r) {
+      var test;
+      if (r.brier_with !== null && r.brier_with !== undefined) {
+        test = 'Split-half Brier ' + r.brier_with + ' with, ' + r.brier_without + ' without';
+      } else {
+        test = 'LOO x' + r.loo_with + ' with, x' + r.loo_without + ' without; walk-forward x' + r.wf_with + ' with, x' + r.wf_without + ' without';
+      }
+      return el('tr', null,
+        el('td', { text: r.term }),
+        el('td', { text: test }),
+        el('td', null, el('span', { class: 'pill ' + (r.kept ? 'farm' : 'skip'), text: r.kept ? 'KEPT' : 'DROPPED' }))
+      );
+    });
+    return el('div', { class: 'table-wrap' },
+      el('table', null,
+        el('caption', { class: 'sub', text: 'Ablation: each term removed alone, every other term held at the full model, the blind tests re-run. A term stays only where removing it hurts a test.' }),
+        el('thead', null, el('tr', null,
+          el('th', { scope: 'col', text: 'Term' }),
+          el('th', { scope: 'col', text: 'Held-out error, with vs without' }),
+          el('th', { scope: 'col', text: 'Verdict' })
+        )),
+        el('tbody', null, bodyRows)
+      )
+    );
+  }
+
   function methodPanel() {
     var a = DATA.accounting;
+    var growthRow = M.ablation.filter(function (r) { return r.term.indexOf('Growth tilt') === 0; })[0];
+    var oddsRow = M.ablation.filter(function (r) { return r.term.indexOf('Odds smoothing') === 0; })[0];
     return el('section', { class: 'panel method' },
       el('h2', { text: 'Method, with the working shown' }),
-      el('div', { class: 'formula', text: 'expected value = size curve(TVL, category) x growth tilt x token odds(age)' }),
+      el('div', { class: 'formula', text: 'expected value = size curve(TVL, category) x token odds(age)' }),
       el('h3', { text: 'The size curve: comps-calibrated' }),
       el('p', { text: 'The snapshot holds ' + M.comp_total + ' traded protocols with a market cap and a TVL (exchange tokens excluded: an exchange token is not a launch comp). The curve is fitted on the ' + M.comp_count + ' launch-like comps whose market cap is not decoupled from their TVL (a market-cap / TVL ratio inside 0.005 to 10), by least squares on log(market cap) against log(TVL), slope ' + M.fit_slope + ': value grows slower than TVL, so a large protocol\'s implied multiple is thinner than a small one\'s. Each category then moves off the common curve by its own offset, shrunk toward zero by its comp count; in this fit the offsets run from x' + Math.exp(Math.min.apply(null, Object.keys(M.cat_offsets).map(function (k) { return M.cat_offsets[k]; }))).toFixed(2) + ' to x' + Math.exp(Math.max.apply(null, Object.keys(M.cat_offsets).map(function (k) { return M.cat_offsets[k]; }))).toFixed(2) + ', so a lending market and a bridge are never priced alike. A row\'s stated multiple is its curve value divided by its TVL.' }),
-      el('h3', { text: 'Tested held-out, not asserted' }),
-      el('p', { text: 'Every fitted term was tested leave-one-out over the ' + M.comp_count + ' launch-like comps the curve is fitted on: each was priced by a fit that never saw it. Median error x' + M.loo_model_factor + ' for this model, against x' + M.loo_global_factor + ' for the global median multiple alone and x' + M.loo_flat_factor + ' for a flat 0.25 x TVL on the same comps; ' + Math.round(M.loo_within_2x * 100) + '% of comps land within a factor of two. Each row\'s honest range is its expected value divided and multiplied by x' + M.loo_model_factor + '. The growth tilt (weight ' + M.growth_weight + ', clamped to ' + M.growth_floor + '%..+' + M.growth_cap + '%) is the one unfitted term: a bounded momentum tilt, disclosed, because one snapshot cannot validate a growth coefficient held-out.' }),
+      el('h3', { text: 'Tested held-out twice, not asserted' }),
+      el('p', { text: 'First test, leave-one-out over the ' + M.comp_count + ' launch-like comps the curve is fitted on: each was priced by a fit that never saw it. Median error x' + M.loo_model_factor + ' for this model, against x' + M.loo_global_factor + ' for the global median multiple alone and x' + M.loo_flat_factor + ' for a flat 0.25 x TVL on the same comps; ' + Math.round(M.loo_within_2x * 100) + '% of comps land within a factor of two. Each row\'s range is the interquartile band of those leave-one-out residuals: half of the held-out comps were priced between x' + M.loo_ratio_q25 + ' and x' + M.loo_ratio_q75 + ' of their actual market cap, and that same band scales every row\'s expected value.' }),
+      el('p', { text: 'Second test, walk-forward in time: the ' + (M.wf_train_count + M.wf_test_count) + ' fitted comps with a recorded listing date are split at ' + M.wf_split_date + '; the curve is fitted on the earlier ' + M.wf_train_count + ' and prices the later ' + M.wf_test_count + ' it never saw. Median error x' + M.wf_model_factor + ', against x' + M.wf_global_factor + ' for the global median multiple and x' + M.wf_flat_factor + ' for the flat 0.25, both fitted on the same earlier half. The ' + (M.comp_count - M.wf_train_count - M.wf_test_count) + ' fitted comps with no recorded date cannot be ordered in time and sit this test out.' }),
+      el('h3', { text: 'Every term kept or dropped on those tests' }),
+      el('p', { text: 'Two candidate terms failed and are not in the model. A growth tilt on 7-day TVL change was grid-searched over weights 0 to 0.6 and chosen by the worse of the two tests; even its best weight left leave-one-out at x' + growthRow.loo_with + ' against x' + growthRow.loo_without + ' without it, so the tilt ships at weight zero: 7-day growth is printed on each row but moves nothing. A monotone smoothing of the token-share curve scored a split-half Brier of ' + oddsRow.brier_with + ' against ' + oddsRow.brier_without + ' for the raw bucket shares, so the odds below use the raw shares. The full ablation:' }),
+      ablationTable(),
       el('h3', { text: 'Token odds: from the peers\' record' }),
-      el('p', { text: 'A launch value is worth nothing if no token ever lists. Bucketing all ' + a.total + ' protocols by the age at which DefiLlama first tracked them, the share already holding a token rises with age; smoothed, that share is S(age). With the share that ever lists capped at ' + Math.round(M.odds_asymptote * 100) + '%, a protocol still tokenless at its age lists with odds (A - S) / (1 - S): the longer it has run with no token, the lower its odds. This is a cross-sectional estimate from one snapshot, not a hazard rate measured over time, and the Method says so wherever the odds are used.' }),
+      el('p', { text: 'A launch value is worth nothing if no token ever lists. Bucketing all ' + a.total + ' protocols by the age at which DefiLlama first tracked them gives the share already holding a token in each age band; that share is S(age), used raw, dips and all, because its smoothing failed the test above. With the share that ever lists capped at ' + Math.round(M.odds_asymptote * 100) + '%, a protocol still tokenless at its age lists with odds (A - S) / (1 - S): the longer it has run with no token, the lower its odds. This is a cross-sectional estimate from one snapshot, not a hazard rate measured over time, and the Method says so wherever the odds are used.' }),
       el('h3', { text: 'Farm verdicts: costed, then netted' }),
       el('p', { text: 'Each plan prices its own chain\'s gas and its capital\'s opportunity cost at ' + Math.round(M.capital_apr * 100) + '% over the hold. The expected reward assumes a ' + Math.round(M.farm_allocation_share * 100) + '% community allocation of the expected launch value, split over competing wallets scaled by the protocol\'s TVL. Net at least $150 is FARM, $0 to $150 is THIN (one wallet, never a farm of wallets), below $0 is SKIP. The assumptions are stated because the verdict is only as good as they are.' }),
       el('h3', { text: 'Accounting and limits' }),
@@ -398,7 +431,7 @@
         cell('Launch value if it lists', fmtUsd(row.launch_value_usd)),
         cell('Token odds at ' + fmtAge(row.age_days), Math.round(row.token_odds * 100) + '%'),
         cell('Expected value', fmtUsd(row.implied_value_usd)),
-        cell('Honest range (held-out x' + M.loo_model_factor + ')', fmtUsd(row.range_low_usd) + ' - ' + fmtUsd(row.range_high_usd)),
+        cell('Held-out interquartile range', fmtUsd(row.range_low_usd) + ' - ' + fmtUsd(row.range_high_usd)),
         cell('7-day TVL growth', fmtPct(row.change_7d)),
         cell('Expected airdrop', fmtUsd(row.expected_reward_usd)),
         cell('Plan true cost', fmtUsd(row.plan_cost_usd))

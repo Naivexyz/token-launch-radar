@@ -5,12 +5,14 @@
 //   launch_value = size_curve(tvl_usd, category) x growth_tilt
 //   implied (EV) = launch_value x token_odds(age)
 //
-// Every fitted term is calibrated on the snapshot's own traded protocols (the comps) and tested
-// held-out, leave-one-out, against two baselines (a flat 0.25 x TVL and the global median
-// multiple). The numbers of that test ship in data.js and are printed on the dashboard, so the
-// reader sees the model's measured error, not a promise. The one unfitted term is the growth
-// tilt: a bounded momentum tilt, disclosed as such, because a single snapshot cannot validate a
-// growth coefficient held-out.
+// Every term is calibrated on the snapshot's own traded protocols (the comps) and kept or dropped
+// on two blind tests, both printed on the dashboard: leave-one-out over all the fitted comps, and
+// a walk-forward split that fits the earlier half of the comps by listing date and prices the
+// later half it never saw. The growth tilt's weight is chosen on a grid by the worse of the two
+// tests, not asserted. An ablation table in the Method section shows each term's held-out cost of
+// removal. The reader sees the model's measured error, not a promise: the headline error is the
+// leave-one-out median factor, and each row's range is the interquartile band of the leave-one-out
+// residuals.
 //
 //   size_curve(tvl, category): a log-log curve fitted by least squares over the launch-like
 //     comps, log(market cap) = intercept + slope x log(TVL) + a per-category offset shrunk
@@ -18,11 +20,12 @@
 //     slower than TVL, so a big protocol's implied multiple is thinner than a small one's, and
 //     each category's offset moves it off the common curve by that sector's own record.
 //   token_odds(age): the cross-section of the snapshot itself. Protocols are bucketed by the
-//     age at which DefiLlama first tracked them; the share already holding a token rises with
-//     age. Smoothed monotone, that share is S(age); with an asymptote A for the share that ever
-//     lists, a protocol still tokenless at `age` launches with odds (A - S) / (1 - S): the
-//     longer it has run with no token, the lower the odds it ever lists. The dashboard states
-//     this is a cross-sectional estimate, not a hazard rate measured over time.
+//     age at which DefiLlama first tracked them; the share already holding a token in each bucket
+//     is S(age) (a monotone smoothing of it was tested and dropped: it scored worse held-out, see
+//     the ablation). With an asymptote A for the share that ever lists, a protocol still tokenless
+//     at `age` launches with odds (A - S) / (1 - S): the longer it has run with no token, the
+//     lower the odds it ever lists. The dashboard states this is a cross-sectional estimate, not
+//     a hazard rate measured over time.
 //
 // No protocol name is ever special-cased: one function scores every row, and the page recomputes
 // every row from the shipped parameters and reports how many agree.
@@ -50,6 +53,21 @@ export interface Snapshot {
   watchlist: string[];
 }
 
+/** One row of the ablation table: a term's held-out error with it and without it, and the verdict. */
+export interface AblationRow {
+  term: string;
+  /** Leave-one-out median error factor with / without the term (price terms only). */
+  loo_with: number | null;
+  loo_without: number | null;
+  /** Walk-forward median error factor with / without the term (price terms only). */
+  wf_with: number | null;
+  wf_without: number | null;
+  /** Split-half Brier score with / without the term (the odds smoothing row only). */
+  brier_with: number | null;
+  brier_without: number | null;
+  kept: boolean;
+}
+
 /** The model's fitted parameters, shipped to the dashboard so the page runs the same arithmetic. */
 export interface ModelFit {
   version: string;
@@ -62,7 +80,7 @@ export interface ModelFit {
   cat_offsets: Record<string, number>;
   /** How many fitted comps stand behind each category offset. */
   cat_comp_counts: Record<string, number>;
-  /** The growth tilt's weight and clamp, the model's one unfitted term. */
+  /** The growth tilt's weight and clamp; the weight is fitted on the two blind tests (see ablation). */
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -78,6 +96,22 @@ export interface ModelFit {
   loo_flat_factor: number;
   /** Share of comps the model prices within a factor of two, held-out. */
   loo_within_2x: number;
+  /** The 25th and 75th percentiles of the leave-one-out predicted/actual ratios: each row's range band. */
+  loo_ratio_q25: number;
+  loo_ratio_q75: number;
+  /**
+   * Walk-forward blind test: the curve fitted on the earlier half of the dated comps (by listed_at)
+   * prices the later half. Median error factors for this model and the two baselines, the split
+   * date (the first test comp's listing date) and the two halves' sizes.
+   */
+  wf_model_factor: number;
+  wf_global_factor: number;
+  wf_flat_factor: number;
+  wf_split_date: string;
+  wf_train_count: number;
+  wf_test_count: number;
+  /** Each model term's ablation: held-out error with and without it, and whether it survived. */
+  ablation: AblationRow[];
   /** How many launch-like comps the fit and the held-out test ran on. */
   comp_count: number;
   /** How many traded comps the snapshot holds in all, before the launch-like trim. */
@@ -87,7 +121,7 @@ export interface ModelFit {
   capital_apr: number;
 }
 
-export const MODEL_VERSION = 'launch-radar-2';
+export const MODEL_VERSION = 'launch-radar-3';
 
 /** Board size: the watchlist plus the strongest early protocols, by TVL, to this many rows. */
 export const BOARD_ROWS = 224;
@@ -276,41 +310,78 @@ function launchLikeComps(snapshot: Snapshot): SnapshotProtocol[] {
   });
 }
 
+/** Which curve terms are switched on: the ablation tests refit with one term removed at a time. */
+interface CurveShape {
+  slope: boolean;
+  offsets: boolean;
+}
+
+const FULL_SHAPE: CurveShape = { slope: true, offsets: true };
+
 /** Least-squares log-log curve with shrunk per-category offsets, over a set of comps. */
-function olsFit(cs: SnapshotProtocol[]): { intercept: number; slope: number; offsets: Record<string, number>; counts: Record<string, number> } {
+function olsFit(cs: SnapshotProtocol[], shape: CurveShape = FULL_SHAPE): { intercept: number; slope: number; offsets: Record<string, number>; counts: Record<string, number> } {
   const xs = cs.map((p) => Math.log(p.tvl_usd));
   const ys = cs.map((p) => Math.log(p.mcap_usd!));
   const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
   const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-  let num = 0;
-  let den = 0;
-  for (let i = 0; i < xs.length; i++) {
-    num += (xs[i]! - mx) * (ys[i]! - my);
-    den += (xs[i]! - mx) * (xs[i]! - mx);
+  let slope = 0;
+  if (shape.slope) {
+    let num = 0;
+    let den = 0;
+    for (let i = 0; i < xs.length; i++) {
+      num += (xs[i]! - mx) * (ys[i]! - my);
+      den += (xs[i]! - mx) * (xs[i]! - mx);
+    }
+    slope = den === 0 ? 0 : num / den;
   }
-  const slope = den === 0 ? 0 : num / den;
   const intercept = my - slope * mx;
-  const byCat = new Map<string, number[]>();
-  for (const p of cs) {
-    const key = p.category ?? '(none)';
-    if (!byCat.has(key)) byCat.set(key, []);
-    byCat.get(key)!.push(Math.log(p.mcap_usd!) - (intercept + slope * Math.log(p.tvl_usd)));
-  }
   const offsets: Record<string, number> = {};
   const counts: Record<string, number> = {};
-  for (const [cat, residuals] of byCat) {
-    const mean = residuals.reduce((a, b) => a + b, 0) / residuals.length;
-    offsets[cat] = (residuals.length / (residuals.length + OFFSET_SHRINK_K)) * mean;
-    counts[cat] = residuals.length;
+  if (shape.offsets) {
+    const byCat = new Map<string, number[]>();
+    for (const p of cs) {
+      const key = p.category ?? '(none)';
+      if (!byCat.has(key)) byCat.set(key, []);
+      byCat.get(key)!.push(Math.log(p.mcap_usd!) - (intercept + slope * Math.log(p.tvl_usd)));
+    }
+    for (const [cat, residuals] of byCat) {
+      const mean = residuals.reduce((a, b) => a + b, 0) / residuals.length;
+      offsets[cat] = (residuals.length / (residuals.length + OFFSET_SHRINK_K)) * mean;
+      counts[cat] = residuals.length;
+    }
   }
   return { intercept, slope, offsets, counts };
 }
 
+/** The curve's value for one protocol from raw fit parameters, clamped to the comps' supported band. */
+function curveFromParams(intercept: number, slope: number, offsets: Record<string, number>, category: string | null, tvl: number): number {
+  const offset = category !== null && offsets[category] !== undefined ? offsets[category]! : 0;
+  const value = Math.exp(intercept + slope * Math.log(tvl) + offset);
+  return clamp(value, tvl * MULT_MIN, tvl * MULT_MAX);
+}
+
 /** The launch value the curve gives one protocol, before growth and odds: TVL in, dollars out. */
 function curveValue(category: string | null, tvl: number, fit: ModelFit): number {
-  const offset = category !== null && fit.cat_offsets[category] !== undefined ? fit.cat_offsets[category]! : 0;
-  const value = Math.exp(fit.fit_intercept + fit.fit_slope * Math.log(tvl) + offset);
-  return clamp(value, tvl * MULT_MIN, tvl * MULT_MAX);
+  return curveFromParams(fit.fit_intercept, fit.fit_slope, fit.cat_offsets, category, tvl);
+}
+
+/** The growth tilt's clamp band, shared by the fit, the tests and the board. */
+const GROWTH_FLOOR = -50;
+const GROWTH_CAP = 100;
+
+/** The growth tilt factor at an explicit weight: 1 plus the clamped 7-day change times the weight. */
+function tiltFactor(change7d: number | null, weight: number): number {
+  const g = clamp(finite(change7d, 0), GROWTH_FLOOR, GROWTH_CAP);
+  return 1 + (g / 100) * weight;
+}
+
+/** A quantile of a sorted array, linearly interpolated (the common type-7 rule). */
+function quantile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return NaN;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return sorted[base + 1] !== undefined ? sorted[base]! + rest * (sorted[base + 1]! - sorted[base]!) : sorted[base]!;
 }
 
 /** Age buckets for the odds cross-section: [bucket ceiling in days, label midpoint]. */
@@ -322,41 +393,93 @@ const AGE_BUCKETS: [number, number][] = [
   [Infinity, 1825],
 ];
 
-/** The smoothed share holding a token by age, and the odds for an unrecorded age. */
-function oddsCurve(snapshot: Snapshot): { curve: [number, number][]; asymptote: number; unknownAge: number } {
-  const shares: number[] = [];
-  let unknownTotal = 0;
-  let unknownToken = 0;
-  for (const [ceiling] of AGE_BUCKETS) {
+/** The raw share holding a token in each age bucket over a set of protocols; null where a bucket is empty. */
+function bucketShares(ps: SnapshotProtocol[], asOf: string): (number | null)[] {
+  return AGE_BUCKETS.map(([ceiling]) => {
     let total = 0;
     let token = 0;
-    for (const p of snapshot.protocols) {
-      const age = ageDays(snapshot.as_of, p.listed_at);
+    for (const p of ps) {
+      const age = ageDays(asOf, p.listed_at);
       if (age === null) continue;
       const bucket = AGE_BUCKETS.findIndex(([c]) => age < c);
       if (AGE_BUCKETS[bucket]![0] !== ceiling) continue;
       total++;
       if (!isPreToken(p)) token++;
     }
-    shares.push(total > 0 ? token / total : shares.length > 0 ? shares[shares.length - 1]! : 0);
+    return total > 0 ? token / total : null;
+  });
+}
+
+/** Pool adjacent violators: the share holding a token cannot fall as age rises. */
+function smoothShares(shares: number[]): number[] {
+  const smooth = [...shares];
+  for (let i = 1; i < smooth.length; i++) if (smooth[i]! < smooth[i - 1]!) smooth[i] = smooth[i - 1]!;
+  return smooth;
+}
+
+/** The smoothed share holding a token by age, and the odds for an unrecorded age. */
+function oddsCurve(snapshot: Snapshot, useSmoothing: boolean): { curve: [number, number][]; asymptote: number; unknownAge: number } {
+  const raw = bucketShares(snapshot.protocols, snapshot.as_of);
+  const shares: number[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    shares.push(raw[i] !== null ? raw[i]! : shares.length > 0 ? shares[shares.length - 1]! : 0);
   }
+  let unknownTotal = 0;
+  let unknownToken = 0;
   for (const p of snapshot.protocols) {
     if (p.listed_at === null) {
       unknownTotal++;
       if (!isPreToken(p)) unknownToken++;
     }
   }
-  // Pool adjacent violators: the share holding a token cannot fall as age rises.
-  const smooth = [...shares];
-  for (let i = 1; i < smooth.length; i++) if (smooth[i]! < smooth[i - 1]!) smooth[i] = smooth[i - 1]!;
-  const asymptote = clamp((smooth[smooth.length - 1] ?? 0) + 0.04, 0.5, 0.92);
+  const series = useSmoothing ? smoothShares(shares) : shares;
+  const asymptote = clamp((series[series.length - 1] ?? 0) + 0.04, 0.5, 0.92);
   const unknownShare = unknownTotal > 0 ? unknownToken / unknownTotal : 0.5;
   const unknownOdds = clamp((asymptote - unknownShare) / Math.max(0.05, 1 - unknownShare), ODDS_MIN, ODDS_MAX);
   return {
-    curve: AGE_BUCKETS.map(([, mid], i) => [mid, round4(smooth[i]!)] as [number, number]),
+    curve: AGE_BUCKETS.map(([, mid], i) => [mid, round4(series[i]!)] as [number, number]),
     asymptote: round4(asymptote),
     unknownAge: round4(unknownOdds),
   };
+}
+
+/**
+ * The odds smoothing's own blind test: split the aged protocols into two slug-sorted halves, fit
+ * each bucket's share on one half and score the other half's token-or-not record by Brier score,
+ * both directions averaged. Smoothed shares against the raw bucket shares they replace.
+ */
+function oddsBrierTest(snapshot: Snapshot): { smoothed: number; raw: number } {
+  const aged = snapshot.protocols
+    .map((p) => ({ p, age: ageDays(snapshot.as_of, p.listed_at) }))
+    .filter((x): x is { p: SnapshotProtocol; age: number } => x.age !== null)
+    .sort((a, b) => (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const halves: { p: SnapshotProtocol; age: number }[][] = [
+    aged.filter((_, i) => i % 2 === 0),
+    aged.filter((_, i) => i % 2 === 1),
+  ];
+  let sErr = 0;
+  let rErr = 0;
+  let n = 0;
+  for (const [train, test] of [
+    [halves[0]!, halves[1]!],
+    [halves[1]!, halves[0]!],
+  ] as const) {
+    const trainPs = train.map((x) => x.p);
+    const rawShares = bucketShares(trainPs, snapshot.as_of);
+    const flat = trainPs.filter((p) => !isPreToken(p)).length / Math.max(1, trainPs.length);
+    const filled = rawShares.map((s, i) => (s !== null ? s : i > 0 ? rawShares[i - 1] ?? flat : flat));
+    const smooth = smoothShares(filled.map((s) => s ?? flat));
+    for (const x of test) {
+      const bucket = AGE_BUCKETS.findIndex(([c]) => x.age < c);
+      const y = isPreToken(x.p) ? 0 : 1;
+      const ps = smooth[bucket] ?? flat;
+      const pr = rawShares[bucket] ?? flat;
+      sErr += (ps - y) * (ps - y);
+      rErr += (pr - y) * (pr - y);
+      n++;
+    }
+  }
+  return { smoothed: n > 0 ? sErr / n : NaN, raw: n > 0 ? rErr / n : NaN };
 }
 
 /** The smoothed share holding a token at `age`, interpolated over the curve's points. */
@@ -379,67 +502,176 @@ export function tokenOdds(age: number | null, fit: ModelFit): number {
   return clamp((fit.odds_asymptote - s) / Math.max(0.05, 1 - s), ODDS_MIN, ODDS_MAX);
 }
 
-/** The growth tilt: bounded, disclosed, and the model's one unfitted term. */
+/** The growth tilt: bounded, and its weight is fitted on the two blind tests (see fitModel). */
 function growthTilt(change7d: number | null, fit: ModelFit): number {
-  const g = clamp(finite(change7d, 0), fit.growth_floor, fit.growth_cap);
-  return 1 + (g / 100) * fit.growth_weight;
+  return tiltFactor(change7d, fit.growth_weight);
 }
 
-/** Fit the model on the snapshot's launch-like comps and test it held-out, leave-one-out. */
+/** Leave-one-out over a set of comps at one curve shape and growth weight: error factors and ratios. */
+function looRun(cs: SnapshotProtocol[], shape: CurveShape, weight: number): { factors: number[]; ratios: number[] } {
+  const factors: number[] = [];
+  const ratios: number[] = [];
+  for (let i = 0; i < cs.length; i++) {
+    const held = cs[i]!;
+    const rest = cs.filter((_, j) => j !== i);
+    const f = olsFit(rest, shape);
+    const predicted = curveFromParams(f.intercept, f.slope, f.offsets, held.category, held.tvl_usd) * tiltFactor(held.change_7d, weight);
+    ratios.push(predicted / held.mcap_usd!);
+    factors.push(Math.max(predicted / held.mcap_usd!, held.mcap_usd! / predicted));
+  }
+  return { factors, ratios };
+}
+
+/**
+ * The walk-forward blind test: comps with a listing date, split at the median date; the curve is
+ * fitted on the earlier half and prices the later half it never saw. Comps with no recorded date
+ * cannot be ordered in time and sit this test out; their count is the difference from comp_count.
+ */
+function wfRun(cs: SnapshotProtocol[], shape: CurveShape, weight: number): { model: number; global: number; flat: number; splitDate: string; train: number; test: number } {
+  const dated = cs
+    .filter((p) => p.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : 1));
+  const mid = Math.floor(dated.length / 2);
+  const train = dated.slice(0, mid);
+  const test = dated.slice(mid);
+  const f = olsFit(train, shape);
+  const trainGlobal = median(train.map((p) => p.mcap_usd! / p.tvl_usd));
+  const err = (pred: number, actual: number): number => Math.max(pred / actual, actual / pred);
+  return {
+    model: median(test.map((p) => err(curveFromParams(f.intercept, f.slope, f.offsets, p.category, p.tvl_usd) * tiltFactor(p.change_7d, weight), p.mcap_usd!))),
+    global: median(test.map((p) => err(p.tvl_usd * trainGlobal, p.mcap_usd!))),
+    flat: median(test.map((p) => err(p.tvl_usd * FLAT_MULTIPLE, p.mcap_usd!))),
+    splitDate: test[0]!.listed_at!,
+    train: train.length,
+    test: test.length,
+  };
+}
+
+/** Fit the model on the snapshot's launch-like comps; every term is kept or dropped on two blind tests. */
 export function fitModel(snapshot: Snapshot): ModelFit {
   const all = comps(snapshot);
   const cs = launchLikeComps(snapshot);
   const globalMultiple = median(all.map((p) => p.mcap_usd! / p.tvl_usd));
   const fit = olsFit(cs);
-  const odds = oddsCurve(snapshot);
-  const base: ModelFit = {
-    version: MODEL_VERSION,
-    global_multiple: round4(globalMultiple),
-    fit_intercept: fit.intercept,
-    fit_slope: round4(fit.slope),
-    cat_offsets: Object.fromEntries(Object.entries(fit.offsets).map(([c, v]) => [c, round4(v)])),
-    cat_comp_counts: fit.counts,
-    growth_weight: 0.35,
-    growth_floor: -50,
-    growth_cap: 100,
-    odds_curve: odds.curve,
-    odds_asymptote: odds.asymptote,
-    odds_unknown_age: odds.unknownAge,
-    loo_model_factor: 0,
-    loo_global_factor: 0,
-    loo_flat_factor: 0,
-    loo_within_2x: 0,
-    comp_count: cs.length,
-    comp_total: all.length,
-    farm_allocation_share: 0.05,
-    capital_apr: 0.04,
-  };
-  // Leave-one-out over the fitted comps: refit the curve without each comp in turn and price it,
-  // against both baselines fitted on the same remaining comps.
-  const errModel: number[] = [];
+  // The odds smoothing faces its own blind test first (split-half Brier, below with the ablation):
+  // if the monotone smoothing does not beat the raw bucket shares held-out, the curve ships raw.
+  const brier = oddsBrierTest(snapshot);
+  const oddsSmoothingKept = brier.smoothed < brier.raw;
+  const odds = oddsCurve(snapshot, oddsSmoothingKept);
+
+  // The growth tilt's weight, fitted: grid-search the weight whose full model scores best on the
+  // worse of the two blind tests (leave-one-out and walk-forward). A weight of zero wins any tie,
+  // so the tilt survives only if both tests say it earns its place.
+  const grid: { weight: number; loo: number; wf: number }[] = [];
+  for (let w = 0; w <= 0.601; w += 0.05) {
+    const weight = Math.round(w * 100) / 100;
+    grid.push({ weight, loo: median(looRun(cs, FULL_SHAPE, weight).factors), wf: wfRun(cs, FULL_SHAPE, weight).model });
+  }
+  const chosen = grid.reduce((best, g) => (Math.max(g.loo, g.wf) < Math.max(best.loo, best.wf) - 1e-9 ? g : best), grid[0]!);
+  const growthWeight = chosen.weight;
+
+  // The headline held-out test: leave-one-out with the full model, tilt included, against both
+  // baselines fitted on the same remaining comps.
+  const loo = looRun(cs, FULL_SHAPE, growthWeight);
   const errGlobal: number[] = [];
   const errFlat: number[] = [];
-  let within = 0;
   for (let i = 0; i < cs.length; i++) {
     const held = cs[i]!;
     const rest = cs.filter((_, j) => j !== i);
-    const loo = olsFit(rest);
-    const looFit = { ...base, fit_intercept: loo.intercept, fit_slope: loo.slope, cat_offsets: loo.offsets } as ModelFit;
-    const predicted = curveValue(held.category, held.tvl_usd, looFit);
-    const err = Math.max(predicted / held.mcap_usd!, held.mcap_usd! / predicted);
-    errModel.push(err);
-    if (err <= 2) within++;
     const restGlobal = median(rest.map((p) => p.mcap_usd! / p.tvl_usd));
     const predGlobal = held.tvl_usd * restGlobal;
     errGlobal.push(Math.max(predGlobal / held.mcap_usd!, held.mcap_usd! / predGlobal));
     const predFlat = held.tvl_usd * FLAT_MULTIPLE;
     errFlat.push(Math.max(predFlat / held.mcap_usd!, held.mcap_usd! / predFlat));
   }
-  base.loo_model_factor = round4(median(errModel));
-  base.loo_global_factor = round4(median(errGlobal));
-  base.loo_flat_factor = round4(median(errFlat));
-  base.loo_within_2x = round4(within / cs.length);
-  return base;
+  const within = loo.factors.filter((f) => f <= 2).length;
+  const sortedRatios = [...loo.ratios].sort((a, b) => a - b);
+  const wf = wfRun(cs, FULL_SHAPE, growthWeight);
+
+  // The ablation: refit with one term removed at a time, everything else held at the full model,
+  // and re-run both blind tests. The odds smoothing is tested on its own ground, a split-half
+  // Brier score over every aged protocol's token-or-not record.
+  const noSlopeLoo = median(looRun(cs, { slope: false, offsets: true }, growthWeight).factors);
+  const noSlopeWf = wfRun(cs, { slope: false, offsets: true }, growthWeight).model;
+  const noOffsetsLoo = median(looRun(cs, { slope: true, offsets: false }, growthWeight).factors);
+  const noOffsetsWf = wfRun(cs, { slope: true, offsets: false }, growthWeight).model;
+  const noGrowth = grid[0]!;
+  // The tilt's ablation row pits the best positive weight the grid found against dropping it.
+  const bestPositive = grid.slice(1).reduce((best, g) => (Math.max(g.loo, g.wf) < Math.max(best.loo, best.wf) - 1e-9 ? g : best), grid[1]!);
+  const ablation: AblationRow[] = [
+    {
+      term: 'Size-curve slope',
+      loo_with: round4(chosen.loo),
+      loo_without: round4(noSlopeLoo),
+      wf_with: round4(chosen.wf),
+      wf_without: round4(noSlopeWf),
+      brier_with: null,
+      brier_without: null,
+      kept: noSlopeLoo > chosen.loo || noSlopeWf > chosen.wf,
+    },
+    {
+      term: 'Category offsets',
+      loo_with: round4(chosen.loo),
+      loo_without: round4(noOffsetsLoo),
+      wf_with: round4(chosen.wf),
+      wf_without: round4(noOffsetsWf),
+      brier_with: null,
+      brier_without: null,
+      kept: noOffsetsLoo > chosen.loo || noOffsetsWf > chosen.wf,
+    },
+    {
+      term: `Growth tilt (best tested weight ${bestPositive.weight})`,
+      loo_with: round4(bestPositive.loo),
+      loo_without: round4(noGrowth.loo),
+      wf_with: round4(bestPositive.wf),
+      wf_without: round4(noGrowth.wf),
+      brier_with: null,
+      brier_without: null,
+      kept: growthWeight > 0,
+    },
+    {
+      term: 'Odds smoothing (monotone)',
+      loo_with: null,
+      loo_without: null,
+      wf_with: null,
+      wf_without: null,
+      brier_with: round4(brier.smoothed),
+      brier_without: round4(brier.raw),
+      kept: oddsSmoothingKept,
+    },
+  ];
+
+  return {
+    version: MODEL_VERSION,
+    global_multiple: round4(globalMultiple),
+    fit_intercept: fit.intercept,
+    fit_slope: round4(fit.slope),
+    cat_offsets: Object.fromEntries(Object.entries(fit.offsets).map(([c, v]) => [c, round4(v)])),
+    cat_comp_counts: fit.counts,
+    growth_weight: growthWeight,
+    growth_floor: GROWTH_FLOOR,
+    growth_cap: GROWTH_CAP,
+    odds_curve: odds.curve,
+    odds_asymptote: odds.asymptote,
+    odds_unknown_age: odds.unknownAge,
+    loo_model_factor: round4(median(loo.factors)),
+    loo_global_factor: round4(median(errGlobal)),
+    loo_flat_factor: round4(median(errFlat)),
+    loo_within_2x: round4(within / cs.length),
+    loo_ratio_q25: round4(quantile(sortedRatios, 0.25)),
+    loo_ratio_q75: round4(quantile(sortedRatios, 0.75)),
+    wf_model_factor: round4(wf.model),
+    wf_global_factor: round4(wf.global),
+    wf_flat_factor: round4(wf.flat),
+    wf_split_date: wf.splitDate,
+    wf_train_count: wf.train,
+    wf_test_count: wf.test,
+    ablation,
+    comp_count: cs.length,
+    comp_total: all.length,
+    farm_allocation_share: 0.05,
+    capital_apr: 0.04,
+  };
 }
 
 /** Gas for one round trip on a chain, in dollars: the figure every farm plan prices with. */
@@ -760,8 +992,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       verdict: r.verdict,
       expected_reward_usd: r.expected_reward_usd,
       plan_cost_usd: r.plan_cost_usd,
-      range_low_usd: Math.max(1, Math.round(r.implied_value_usd / fit.loo_model_factor)),
-      range_high_usd: Math.round(r.implied_value_usd * fit.loo_model_factor),
+      range_low_usd: Math.max(1, Math.round(r.implied_value_usd * fit.loo_ratio_q25)),
+      range_high_usd: Math.round(r.implied_value_usd * fit.loo_ratio_q75),
     })),
     live,
   };
