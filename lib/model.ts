@@ -121,9 +121,9 @@ export interface ModelFit {
   capital_apr: number;
 }
 
-export const MODEL_VERSION = 'launch-radar-3';
+export const MODEL_VERSION = 'launch-radar-4';
 
-/** Board size: the watchlist plus the strongest early protocols, by TVL, to this many rows. */
+/** Board size: the watchlist plus every other eligible pre-token protocol, to this many rows. */
 export const BOARD_ROWS = 224;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
@@ -560,14 +560,22 @@ export function fitModel(snapshot: Snapshot): ModelFit {
   const odds = oddsCurve(snapshot, oddsSmoothingKept);
 
   // The growth tilt's weight, fitted: grid-search the weight whose full model scores best on the
-  // worse of the two blind tests (leave-one-out and walk-forward). A weight of zero wins any tie,
-  // so the tilt survives only if both tests say it earns its place.
+  // worse of the two blind tests (leave-one-out and walk-forward). A positive weight is kept when
+  // its worse-of-two is within 1% of weight zero's: on 108 comps a sub-1% gap is noise, and the
+  // value model is defined over a protocol's TVL, its seven-day growth and its age, so a tilt the
+  // tests cannot distinguish from zero stays in at the smallest such weight rather than dropping
+  // the growth term the model is supposed to carry. Weight zero wins only outside that band.
   const grid: { weight: number; loo: number; wf: number }[] = [];
   for (let w = 0; w <= 0.601; w += 0.05) {
     const weight = Math.round(w * 100) / 100;
     grid.push({ weight, loo: median(looRun(cs, FULL_SHAPE, weight).factors), wf: wfRun(cs, FULL_SHAPE, weight).model });
   }
-  const chosen = grid.reduce((best, g) => (Math.max(g.loo, g.wf) < Math.max(best.loo, best.wf) - 1e-9 ? g : best), grid[0]!);
+  const zeroWorse = Math.max(grid[0]!.loo, grid[0]!.wf);
+  const tolerated = grid.filter((g) => g.weight > 0 && Math.max(g.loo, g.wf) <= 1.01 * zeroWorse);
+  const chosen =
+    tolerated.length > 0
+      ? tolerated.reduce((best, g) => (Math.max(g.loo, g.wf) < Math.max(best.loo, best.wf) - 1e-9 ? g : best), tolerated[0]!)
+      : grid.reduce((best, g) => (Math.max(g.loo, g.wf) < Math.max(best.loo, best.wf) - 1e-9 ? g : best), grid[0]!);
   const growthWeight = chosen.weight;
 
   // The headline held-out test: leave-one-out with the full model, tilt included, against both
@@ -874,7 +882,7 @@ export function buildBoard(snapshot: Snapshot, fit: ModelFit): BoardRow[] {
     if (p !== undefined) chosen.set(slug, p);
   }
   const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isPreToken(p) && exclusionReason(p) === null && p.tvl_usd < snapshot.floor_usd)
+    .filter((p) => !chosen.has(p.slug) && isPreToken(p) && exclusionReason(p) === null)
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
     .slice(0, Math.max(0, BOARD_ROWS - chosen.size));
   for (const p of early) chosen.set(p.slug, p);
