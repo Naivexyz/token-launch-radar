@@ -1,14 +1,19 @@
-// Launch Radar: a token-radar-01 entry (Node 22, standard library only).
+// Launch Radar v4: token-radar-01 entry (Node 22+, standard library only).
 //
-// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the
-// comps-calibrated model in lib/model.ts on the snapshot's own traded protocols, ranks pre-token
-// protocols by expected launch value (launch value x the odds a token ever lists), writes the board
-// to /output/board.json, and copies this repository's dashboard/ and screenshots/ to /output. Last,
-// it writes /output/dossier.json, the summary the judge reads, with the vendored make.fun library.
+// What this program does, in order:
+//   1. Reads the sealed snapshot (/input/snapshot.json, or --input <file|dir>).
+//   2. Fits the comps-calibrated model in lib/model.ts on the snapshot's own traded
+//      protocols, ranks every eligible pre-token protocol by expected launch value
+//      (launch value x the odds a token ever lists), and validates the board against
+//      the scorer's gate before anything is written.
+//   3. Writes /output/board.json and /output/data.js (the dashboard's dataset),
+//      copies dashboard/ and screenshots/ into /output, and finally writes
+//      /output/dossier.json with the vendored make.fun library — the dossier is last
+//      because the scorer rebuilds it from /output and compares bytes.
 //
-// The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
-// and dashboard/app.js read /output/data.js, which this program writes from the same board, and the
-// page recomputes every row from the shipped fit to prove the two agree.
+// The dashboard is a static page with no framework and no network: dashboard/index.html,
+// dashboard/app.css and dashboard/app.js read data.js, and the page recomputes every row
+// from the shipped fit to prove the board and the code agree.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -21,17 +26,17 @@ import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 
-/** The scorer's own caps (reference/gate.json): the text cap shapes the bytes, the rest refuse. */
+/** The scorer's own caps (from reference/gate.json): the text cap shapes the bytes, the rest refuse. */
 const TEXT_MAX_BYTES = 65_536;
 const SCREENSHOT_CAPS = { max: 4, max_bytes: 524_288 };
 const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 
-/** --name <value> out of the arguments, or the fallback. */
+/** The value of `--name <value>` (or `--name=<value>`) among the arguments, else the fallback. */
 function arg(name: string, fallback: string): string {
   const at = process.argv.indexOf(`--${name}`);
   if (at >= 0 && at + 1 < process.argv.length) return process.argv[at + 1]!;
-  const withEquals = process.argv.find((a) => a.startsWith(`--${name}=`));
-  return withEquals === undefined ? fallback : withEquals.slice(name.length + 3);
+  const glued = process.argv.find((a) => a.startsWith(`--${name}=`));
+  return glued === undefined ? fallback : glued.slice(name.length + 3);
 }
 
 const inputArg = arg('input', '/input');
@@ -54,7 +59,7 @@ mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
 
-/** Copy one directory's regular files into `to`, skipping names that start with a dot. */
+/** Copy a directory's regular files into `to`, skipping dotfiles, and return the names copied. */
 function copyFiles(from: string, to: string): string[] {
   if (!existsSync(from)) return [];
   mkdirSync(to, { recursive: true });
@@ -82,7 +87,7 @@ for (const name of shots) {
   }
 }
 
-// The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
+// Dossier last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 process.stdout.write(

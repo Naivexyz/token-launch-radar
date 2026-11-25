@@ -1,8 +1,8 @@
-// Launch Radar's dashboard. It reads window.RADAR (written beside dashboard/ by main.ts) and renders
-// the ranked board, a filterable table, a per-protocol detail view with the model's own inputs and
-// the protocol's costed farm plan, and the full method. No network: every byte it shows is in
-// data.js. The page recomputes every row from the shipped fit and reports how many agree, so the
-// code and the board are visibly the same arithmetic.
+// Launch Radar v4 dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
+// and renders the ranked board, a filterable table, a per-protocol detail view with the
+// model's own inputs and the protocol's costed farm plan, and the full method. No network:
+// every byte it shows is in data.js. The page recomputes every row from the shipped fit and
+// reports how many agree, so the code and the board are visibly the same arithmetic.
 (function () {
   'use strict';
 
@@ -63,6 +63,7 @@
   var recomputed = 0;
   DATA.rows.forEach(function (r) { if (impliedOf(r) === r.implied_value_usd) recomputed++; });
 
+  // Tiny element builder: el('div', {class, text, onclick...}, children...)
   function el(tag, attrs) {
     var node = document.createElement(tag);
     if (attrs) {
@@ -148,6 +149,7 @@
     ].map(stepText);
   }
 
+  // Filters and sorting live in the URL hash, so a filtered view is shareable.
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
@@ -194,6 +196,7 @@
     });
   }
 
+  // Page sections, top to bottom.
   function header() {
     return el('header', { class: 'top' },
       el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Launch Radar' })),
@@ -352,6 +355,7 @@
     );
   }
 
+  // The Method: every claim on the page is either a number the fit produced or a rule stated here.
   function ablationTable() {
     var bodyRows = M.ablation.map(function (r) {
       var test;

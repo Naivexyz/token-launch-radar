@@ -1,36 +1,35 @@
-// Launch Radar's model: one sealed snapshot in, one ranked board out.
+// Launch Radar v4 — the model: one sealed snapshot in, one ranked board out.
 //
 // The board ranks pre-token protocols by expected launch value:
 //
-//   launch_value = size_curve(tvl_usd, category) x growth_tilt
-//   implied (EV) = launch_value x token_odds(age)
+//   launch_value = size_curve(tvl_usd, category) x growth_tilt(7-day change)
+//   implied value (EV) = launch_value x token_odds(age)
 //
-// Every term is calibrated on the snapshot's own traded protocols (the comps) and kept or dropped
-// on two blind tests, both printed on the dashboard: leave-one-out over all the fitted comps, and
-// a walk-forward split that fits the earlier half of the comps by listing date and prices the
-// later half it never saw. The growth tilt's weight is chosen on a grid by the worse of the two
-// tests, not asserted. An ablation table in the Method section shows each term's held-out cost of
-// removal. The reader sees the model's measured error, not a promise: the headline error is the
-// leave-one-out median factor, and each row's range is the interquartile band of the leave-one-out
-// residuals.
+// Every term is calibrated on the snapshot's own traded protocols (the comps) and kept
+// or dropped on two blind tests, both printed on the dashboard: leave-one-out over all
+// the fitted comps, and a walk-forward split that fits the earlier half of the comps by
+// listing date and prices the later half it never saw. The growth tilt's weight is chosen
+// on a grid by the worse of the two tests, never asserted. An ablation table in the Method
+// section shows each term's held-out cost of removal. The reader sees the model's measured
+// error, not a promise: the headline error is the leave-one-out median factor, and each
+// row's range is the interquartile band of the leave-one-out residuals.
 //
 //   size_curve(tvl, category): a log-log curve fitted by least squares over the launch-like
 //     comps, log(market cap) = intercept + slope x log(TVL) + a per-category offset shrunk
-//     toward zero by the category's comp count. The curve's slope is well under 1: value grows
-//     slower than TVL, so a big protocol's implied multiple is thinner than a small one's, and
-//     each category's offset moves it off the common curve by that sector's own record.
+//     toward zero by the category's comp count. The fitted slope is well under 1: value grows
+//     slower than TVL, so a big protocol's implied multiple is thinner than a small one's,
+//     and each category's offset moves it off the common curve by that sector's own record.
 //   token_odds(age): the cross-section of the snapshot itself. Protocols are bucketed by the
-//     age at which DefiLlama first tracked them; the share already holding a token in each bucket
-//     is S(age) (a monotone smoothing of it was tested and dropped: it scored worse held-out, see
-//     the ablation). With an asymptote A for the share that ever lists, a protocol still tokenless
-//     at `age` launches with odds (A - S) / (1 - S): the longer it has run with no token, the
-//     lower the odds it ever lists. The dashboard states this is a cross-sectional estimate, not
-//     a hazard rate measured over time.
+//     age at which DefiLlama first tracked them; the share already holding a token in each
+//     bucket is S(age). With an asymptote A for the share that ever lists, a protocol still
+//     tokenless at `age` launches with odds (A - S) / (1 - S): the longer it has run with no
+//     token, the lower the odds it ever lists. The dashboard states this is a cross-sectional
+//     estimate, not a hazard rate measured over time.
 //
-// No protocol name is ever special-cased: one function scores every row, and the page recomputes
-// every row from the shipped parameters and reports how many agree.
+// No protocol name is ever special-cased: one function scores every row, and the dashboard
+// recomputes every row from the shipped parameters and reports how many agree.
 
-/** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
+/** One protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
   slug: string;
   name: string;
@@ -80,11 +79,11 @@ export interface ModelFit {
   cat_offsets: Record<string, number>;
   /** How many fitted comps stand behind each category offset. */
   cat_comp_counts: Record<string, number>;
-  /** The growth tilt's weight and clamp; the weight is fitted on the two blind tests (see ablation). */
+  /** The growth tilt's weight and clamp; the weight is fitted on the two blind tests (see fitModel). */
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
-  /** The smoothed share of protocols holding a token, by age in days: [age_days, share] points. */
+  /** The share of protocols holding a token, by age in days: [age_days, share] points. */
   odds_curve: [number, number][];
   /** The share of protocols assumed ever to list a token. */
   odds_asymptote: number;
@@ -121,7 +120,7 @@ export interface ModelFit {
   capital_apr: number;
 }
 
-export const MODEL_VERSION = 'launch-radar-4';
+export const MODEL_VERSION = 'launch-radar-5';
 
 /** Board size: the watchlist plus every other eligible pre-token protocol, to this many rows. */
 export const BOARD_ROWS = 224;
@@ -146,6 +145,11 @@ const MULT_MAX = 5;
 /** Odds clamps: no launch is certain, none is impossible. */
 const ODDS_MIN = 0.03;
 const ODDS_MAX = 0.95;
+/** The growth tilt's clamp band, shared by the fit, the tests and the board. */
+const GROWTH_FLOOR = -50;
+const GROWTH_CAP = 100;
+
+const DAY_MS = 86_400_000;
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -253,7 +257,9 @@ export class SnapshotError extends Error {
   }
 }
 
-const DAY_MS = 86_400_000;
+// ---------------------------------------------------------------------------
+// Small utilities
+// ---------------------------------------------------------------------------
 
 function finite(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -261,6 +267,21 @@ function finite(value: unknown, fallback: number): number {
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((x, y) => x - y);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/** A quantile of a sorted array, linearly interpolated (the common type-7 rule). */
+function quantile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return NaN;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return sorted[base + 1] !== undefined ? sorted[base]! + rest * (sorted[base + 1]! - sorted[base]!) : sorted[base]!;
+}
 
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
@@ -271,11 +292,9 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((x, y) => x - y);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
-}
+// ---------------------------------------------------------------------------
+// Classification: which protocols are pre-token, and why one is not ranked
+// ---------------------------------------------------------------------------
 
 /** Whether a protocol records no token at all. */
 export function isPreToken(p: SnapshotProtocol): boolean {
@@ -296,6 +315,10 @@ export function exclusionReason(p: SnapshotProtocol): 'versioned' | 'cex' | 'wra
   if (/\b(wrapped|staked|staking)\b/i.test(p.name)) return 'wrapped_or_staked';
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// The size curve: comps, least-squares fit, and the value it gives one protocol
+// ---------------------------------------------------------------------------
 
 /** The traded protocols the fit learns from: a token, a market cap and a TVL, and not an exchange token. */
 function comps(snapshot: Snapshot): SnapshotProtocol[] {
@@ -365,9 +388,9 @@ function curveValue(category: string | null, tvl: number, fit: ModelFit): number
   return curveFromParams(fit.fit_intercept, fit.fit_slope, fit.cat_offsets, category, tvl);
 }
 
-/** The growth tilt's clamp band, shared by the fit, the tests and the board. */
-const GROWTH_FLOOR = -50;
-const GROWTH_CAP = 100;
+// ---------------------------------------------------------------------------
+// The growth tilt: 1 plus the clamped 7-day change times the fitted weight.
+// ---------------------------------------------------------------------------
 
 /** The growth tilt factor at an explicit weight: 1 plus the clamped 7-day change times the weight. */
 function tiltFactor(change7d: number | null, weight: number): number {
@@ -375,14 +398,14 @@ function tiltFactor(change7d: number | null, weight: number): number {
   return 1 + (g / 100) * weight;
 }
 
-/** A quantile of a sorted array, linearly interpolated (the common type-7 rule). */
-function quantile(sorted: number[], q: number): number {
-  if (sorted.length === 0) return NaN;
-  const pos = (sorted.length - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  return sorted[base + 1] !== undefined ? sorted[base]! + rest * (sorted[base + 1]! - sorted[base]!) : sorted[base]!;
+/** The growth tilt: bounded, and its weight is fitted on the two blind tests (see fitModel). */
+function growthTilt(change7d: number | null, fit: ModelFit): number {
+  return tiltFactor(change7d, fit.growth_weight);
 }
+
+// ---------------------------------------------------------------------------
+// Token odds: the age cross-section, its smoothing, and the odds it implies
+// ---------------------------------------------------------------------------
 
 /** Age buckets for the odds cross-section: [bucket ceiling in days, label midpoint]. */
 const AGE_BUCKETS: [number, number][] = [
@@ -502,10 +525,9 @@ export function tokenOdds(age: number | null, fit: ModelFit): number {
   return clamp((fit.odds_asymptote - s) / Math.max(0.05, 1 - s), ODDS_MIN, ODDS_MAX);
 }
 
-/** The growth tilt: bounded, and its weight is fitted on the two blind tests (see fitModel). */
-function growthTilt(change7d: number | null, fit: ModelFit): number {
-  return tiltFactor(change7d, fit.growth_weight);
-}
+// ---------------------------------------------------------------------------
+// The two blind tests, and the fit that runs them
+// ---------------------------------------------------------------------------
 
 /** Leave-one-out over a set of comps at one curve shape and growth weight: error factors and ratios. */
 function looRun(cs: SnapshotProtocol[], shape: CurveShape, weight: number): { factors: number[]; ratios: number[] } {
@@ -681,6 +703,10 @@ export function fitModel(snapshot: Snapshot): ModelFit {
     capital_apr: 0.04,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Farm plans: a costed plan per protocol, and the verdict that nets it
+// ---------------------------------------------------------------------------
 
 /** Gas for one round trip on a chain, in dollars: the figure every farm plan prices with. */
 const CHAIN_GAS: Record<string, number> = {
@@ -873,6 +899,10 @@ export function farmPlan(
   return { steps, verdict, expectedReward: Math.round(expectedReward), planCost: Math.round(planCost) };
 }
 
+// ---------------------------------------------------------------------------
+// The board, the accounting, and the dashboard payload
+// ---------------------------------------------------------------------------
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, fit: ModelFit): BoardRow[] {
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
@@ -927,12 +957,9 @@ export function buildBoard(snapshot: Snapshot, fit: ModelFit): BoardRow[] {
 /** Every protocol in the snapshot accounted for: ranked, live, or excluded with its reason. */
 export function accounting(snapshot: Snapshot, boardSize: number): Accounting {
   let live = 0;
-  let below = 0;
   let versioned = 0;
   let cex = 0;
   let wrapped = 0;
-  const boardSlugs = new Set<string>();
-  void boardSlugs;
   for (const p of snapshot.protocols) {
     if (!isPreToken(p)) {
       live++;
@@ -944,7 +971,7 @@ export function accounting(snapshot: Snapshot, boardSize: number): Accounting {
     else if (reason === 'wrapped_or_staked') wrapped++;
   }
   const preToken = snapshot.protocols.filter(isPreToken).length;
-  below = preToken - versioned - cex - wrapped - boardSize;
+  const below = preToken - versioned - cex - wrapped - boardSize;
   return { total: snapshot.protocols.length, ranked: boardSize, live, unranked: below, versioned, cex, wrapped_or_staked: wrapped };
 }
 
@@ -1007,6 +1034,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   };
   return { board, radar };
 }
+
+// ---------------------------------------------------------------------------
+// Input validation, the gate check, and the dashboard's data script
+// ---------------------------------------------------------------------------
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
 export function parseSnapshot(text: string): Snapshot {
